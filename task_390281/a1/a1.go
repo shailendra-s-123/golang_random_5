@@ -2,7 +2,7 @@
 package errorreporter
 
 import (
-	"log"
+	_"log"
 
 	"github.com/getsentry/sentry-go"
 )
