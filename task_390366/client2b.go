@@ -11,32 +11,29 @@ import (
 )
 
 func main() {
-	conn, err := net.Dial("tcp", "localhost:8080")
+	if len(os.Args) != 2 {
+		log.Fatalln("Usage: client <server_address>")
+	}
+
+	conn, err := net.Dial("tcp", os.Args[1])
 	if err != nil {
 		log.Fatalf("Error connecting to server: %v", err)
 	}
 	defer conn.Close()
 
-	// Authentication
-	var username, password string
-	reader := bufio.NewReader(os.Stdin)
+	reader := bufio.NewReader(conn)
+	fmt.Print("Please enter your username: ")
+	username, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	username = strings.TrimSpace(username)
 
-	// Get username
-	fmt.Print("Enter your username: ")
-	username, _ = reader.ReadString('\n')
-	username = username[:len(username)-1] // Remove newline
+	fmt.Print("Please enter your password: ")
+	password, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	password = strings.TrimSpace(password)
 
-	// Get password
-	fmt.Print("Enter your password: ")
-	password, _ = reader.ReadString('\n')
-	password = password[:len(password)-1] // Remove newline
-
-	// Send credentials
 	conn.Write([]byte(username + "\n"))
 	conn.Write([]byte(password + "\n"))
 
 	go func() {
-		reader := bufio.NewReader(conn)
 		for {
 			msg, _ := reader.ReadString('\n')
 			fmt.Print(msg)

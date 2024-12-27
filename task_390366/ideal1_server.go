@@ -16,7 +16,6 @@ type Server struct {
 	clientMutex sync.Mutex
 	broadcastCh chan string
 	privateCh   chan privateMessage
-	users       map[string]string // username: password
 }
 
 type privateMessage struct {
@@ -29,11 +28,6 @@ func NewServer() *Server {
 		clients:     make(map[string]net.Conn),
 		broadcastCh: make(chan string),
 		privateCh:   make(chan privateMessage),
-		users: map[string]string{
-			"user1": "password1",
-			"user2": "password2",
-			"user3": "password3",
-		},
 	}
 }
 
@@ -64,7 +58,6 @@ func (s *Server) startTCPServer(address string) {
 			continue
 		}
 
-		// Handle client authentication
 		go s.handleClient(conn)
 	}
 }
@@ -84,41 +77,18 @@ func (s *Server) startHTTPServer() {
 func (s *Server) handleClient(conn net.Conn) {
 	defer conn.Close()
 
-	// Authentication loop
-	for {
-		conn.Write([]byte("Enter your username: "))
-		var username string
-		fmt.Fscan(conn, &username)
+	conn.Write([]byte("Enter your username: "))
+	var username string
+	fmt.Fscan(conn, &username)
 
-		conn.Write([]byte("Enter your password: "))
-		var password string
-		fmt.Fscan(conn, &password)
+	s.clientMutex.Lock()
+	s.clients[username] = conn
+	s.clientMutex.Unlock()
 
-		if s.authenticate(username, password) {
-			s.clientMutex.Lock()
-			s.clients[username] = conn
-			s.clientMutex.Unlock()
+	log.Printf("New client connected: %s", username)
 
-			log.Printf("Client authenticated: %s", username)
-			s.broadcastCh <- fmt.Sprintf("%s has joined the chat!", username)
-			break
-		} else {
-			conn.Write([]byte("Invalid credentials. Please try again.\n"))
-		}
-	}
+	s.broadcastCh <- fmt.Sprintf("%s has joined the chat!", username)
 
-	// Handle chat messages
-	s.receiveMessages(conn, username)
-}
-
-func (s *Server) authenticate(username, password string) bool {
-	if pass, exists := s.users[username]; exists && pass == password {
-		return true
-	}
-	return false
-}
-
-func (s *Server) receiveMessages(conn net.Conn, username string) {
 	buffer := make([]byte, 1024)
 	for {
 		n, err := conn.Read(buffer)

@@ -1,128 +1,194 @@
 // server.go
+
 package main
 
 import (
-    "bufio"
-    "fmt"
-    "log"
-    "net"
-    "sync"
-    "time"
+	"bufio"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
 )
 
-const (
-    messageBatchSize = 5 // Number of messages to batch before broadcasting
-    batchInterval     = 50 * time.Millisecond // Interval to send batched messages
-)
-
-type Client struct {
-    conn    net.Conn
-    addr    string
-    reader  *bufio.Reader
-    writer  *bufio.Writer
-    lastMsg time.Time
+type Server struct {
+	clients     map[string]net.Conn
+	clientMutex sync.Mutex
+	broadcastCh chan string
+	privateCh   chan privateMessage
+	authCreds   map[string]string
 }
 
-var (
-    clients     map[string]*Client
-    clientsMu   sync.RWMutex
-    messageChan = make(chan string)
-    batchWg     sync.WaitGroup
-)
-
-func startBatcher() {
-    batchWg.Add(1)
-    defer batchWg.Done()
-
-    ticker := time.NewTicker(batchInterval)
-    for {
-        select {
-        case msg := <-messageChan:
-            clientsMu.RLock()
-            defer clientsMu.RUnlock()
-            for _, client := range clients {
-                client.lastMsg = time.Now()
-                if _, err := client.writer.WriteString(msg + "\n"); err != nil {
-                    log.Printf("Error writing to client %s: %v", client.addr, err)
-                    clientsMu.Lock()
-                    delete(clients, client.addr)
-                    clientsMu.Unlock()
-                    client.conn.Close()
-                }
-            }
-        case <-ticker.C:
-            clientsMu.RLock()
-            for addr, client := range clients {
-                if time.Since(client.lastMsg) > 30*time.Second {
-                    log.Printf("Disconnecting idle client %s", addr)
-                    clientsMu.Lock()
-                    delete(clients, addr)
-                    clientsMu.Unlock()
-                    client.conn.Close()
-                }
-            }
-            clientsMu.RUnlock()
-        case <-time.After(time.Minute):
-            log.Println("Server status:", len(clients), "connected clients")
-        }
-    }
+type privateMessage struct {
+	recipient string
+	message   string
 }
 
-func handleConnection(conn net.Conn) {
-    defer conn.Close()
+func NewServer() *Server {
+	// Predefined credentials for demonstration purposes
+	authCreds := map[string]string{
+		"alice": "password123",
+		"bob":   "securepass",
+	}
+	return &Server{
+		clients:     make(map[string]net.Conn),
+		broadcastCh: make(chan string),
+		privateCh:   make(chan privateMessage),
+		authCreds:   authCreds,
+	}
+}
 
-    reader := bufio.NewReader(conn)
-    writer := bufio.NewWriter(conn)
-    defer writer.Flush()
+func (s *Server) Start(address string) {
+	go s.startTCPServer(address)
+	go s.startHTTPServer()
 
-    addr := conn.RemoteAddr().String()
-    clientsMu.Lock()
-    clients[addr] = &Client{conn, addr, reader, writer, time.Now()}
-    clientsMu.Unlock()
+	// Concurrently handle broadcasts and private messages
+	go s.handleBroadcasts()
+	go s.handlePrivateMessages()
 
-    log.Printf("New client connected: %s\n", addr)
+	select {}
+}
 
-    for {
-        message, err := reader.ReadString('\n')
-        if err != nil {
-            log.Printf("Error reading from client %s: %v", addr, err)
-            break
-        }
+func (s *Server) startTCPServer(address string) {
+	ln, err := net.Listen("tcp", address)
+	if err != nil {
+		log.Fatalf("Error starting TCP server: %v", err)
+	}
+	defer ln.Close()
 
-        message = addr + ": " + message
-        messageChan <- message
-    }
+	log.Printf("TCP server listening on %s", address)
 
-    clientsMu.Lock()
-    delete(clients, addr)
-    clientsMu.Unlock()
-    log.Printf("Client disconnected: %s\n", addr)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("Error accepting connection: %v", err)
+			continue
+		}
+
+		go s.handleClientAuthentication(conn)
+	}
+}
+
+func (s *Server) handleClientAuthentication(conn net.Conn) {
+	defer conn.Close()
+
+	fmt.Fprintln(conn, "Enter your username:")
+	username, err := readLine(conn)
+	if err != nil {
+		log.Printf("Error reading username: %v", err)
+		return
+	}
+
+	fmt.Fprintln(conn, "Enter your password:")
+	password, err := readLine(conn)
+	if err != nil {
+		log.Printf("Error reading password: %v", err)
+		return
+	}
+
+	if s.authenticate(username, password) {
+		s.clientMutex.Lock()
+		s.clients[username] = conn
+		s.clientMutex.Unlock()
+
+		log.Printf("New client connected: %s", username)
+
+		s.broadcastCh <- fmt.Sprintf("%s has joined the chat!", username)
+
+		buffer := make([]byte, 1024)
+		for {
+			n, err := conn.Read(buffer)
+			if err != nil {
+				log.Printf("Error reading from client %s: %v", username, err)
+				break
+			}
+			message := string(buffer[:n])
+
+			if strings.HasPrefix(message, "/private") {
+				parts := strings.SplitN(message, " ", 3)
+				if len(parts) < 3 {
+					conn.Write([]byte("Usage: /private <username> <message>\n"))
+					continue
+				}
+
+				recipient := parts[1]
+				privateMsg := parts[2]
+				s.privateCh <- privateMessage{recipient, privateMsg}
+			} else {
+				s.broadcastCh <- fmt.Sprintf("%s: %s", username, message)
+			}
+		}
+
+		s.clientMutex.Lock()
+		delete(s.clients, username)
+		s.clientMutex.Unlock()
+
+		s.broadcastCh <- fmt.Sprintf("%s has left the chat!", username)
+	} else {
+		conn.Write([]byte("Invalid credentials.\n"))
+		conn.Close()
+		log.Printf("Authentication failed for: %s", username)
+	}
+}
+
+func (s *Server) authenticate(username, password string) bool {
+	_, exists := s.authCreds[username]
+	if !exists {
+		return false
+	}
+	return s.authCreds[username] == password
+}
+
+func (s *Server) startHTTPServer() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("<h1>Welcome to the Chat Server!</h1><p>Connect to the server via <strong>localhost:8080</strong> for chat.</p>"))
+	})
+
+	log.Println("HTTP server started on http://localhost:8081")
+	err := http.ListenAndServe(":8081", nil)
+	if err != nil {
+		log.Fatalf("HTTP server failed: %v", err)
+	}
+}
+
+func (s *Server) handleBroadcasts() {
+	for {
+		msg := <-s.broadcastCh
+		s.clientMutex.Lock()
+		for _, conn := range s.clients {
+			conn.Write([]byte(msg + "\n"))
+		}
+		s.clientMutex.Unlock()
+	}
+}
+
+func (s *Server) handlePrivateMessages() {
+	for {
+		msg := <-s.privateCh
+		s.clientMutex.Lock()
+		conn, exists := s.clients[msg.recipient]
+		s.clientMutex.Unlock()
+
+		if !exists {
+			log.Printf("Private message failed: user %s not found", msg.recipient)
+			continue
+		}
+
+		conn.Write([]byte("Private message from " + msg.message + "\n"))
+	}
+}
+
+func readLine(conn net.Conn) (string, error) {
+	reader := bufio.NewReader(conn)
+	line, _, err := reader.ReadLine()
+	if err != nil {
+		return "", err
+	}
+	return string(line), nil
 }
 
 func main() {
-    log.Println("Chat server started on :8080")
-
-    listeners := make([]net.Listener, 5) // Simple load balancing via multiple listeners
-    for i := 0; i < 5; i++ {
-        listener, err := net.Listen("tcp", fmt.Sprintf(":%d", 8080+i))
-        if err != nil {
-            log.Fatal(err)
-        }
-        listeners[i] = listener
-    }
-
-    go startBatcher()
-
-    for _, listener := range listeners {
-        defer listener.Close()
-
-        for {
-            conn, err := listener.Accept()
-            if err != nil {
-                log.Printf("Error accepting connection: %v", err)
-                continue
-            }
-            go handleConnection(conn)
-        }
-    }
+	server := NewServer()
+	server.Start(":8080")
 }
