@@ -1,96 +1,98 @@
 package main
 
 import (
-	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"sync"
 	"time"
-
-	"github.com/dgrijalva/jwt-go"
-	"testing"
 )
 
-func TestJWTVulnerabilities(t *testing.T) {
-	// Sample secret for HMAC signing
-	secret := []byte("supersecret")
+// Simulated message broker for eventual consistency
+var messageBroker = make(chan string)
 
-	// Test token signing with 'none' algorithm
-	noneToken := jwt.New(jwt.SigningMethodNone)
-	noneToken.Claims = map[string]interface{}{
-		"sub": "1234567890",
-		"name": "John Doe",
-		"iat": time.Now().Unix(),
-	}
-	noneTokenString, err := noneToken.SignedString(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	testInvalidToken(t, noneTokenString, secret)
+// Simulated database for Service A and B
+var dbA = make(map[string]string)
+var dbB = make(map[string]string)
 
-	// Test expired token
-	expiredToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.StandardClaims{
-		Subject:  "1234567890",
-		Name:     "John Doe",
-		IssuedAt: time.Now().Unix(),
-		ExpiresAt: time.Now().Add(-1 * time.Minute).Unix(),
-	})
-	expiredTokenString, err := expiredToken.SignedString(secret)
-	if err != nil {
-		t.Fatal(err)
-	}
-	testExpiredToken(t, expiredTokenString)
+// Mutex for synchronizing access to databases
+var muA sync.Mutex
+var muB sync.Mutex
 
-	// Test weak signing algorithm (HS224)
-	weakToken := jwt.NewWithClaims(jwt.SigningMethodHS224, jwt.StandardClaims{
-		Subject:  "1234567890",
-		Name:     "John Doe",
-		IssuedAt: time.Now().Unix(),
-	})
-	weakTokenString, err := weakToken.SignedString(secret)
-	if err != nil {
-		t.Fatal(err)
+// Service A: Strong Consistency
+func serviceA(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
 	}
-	testWeakSigningAlgorithm(t, weakTokenString, secret)
+
+	var data map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	// Start a distributed transaction
+	muA.Lock()
+	defer muA.Unlock()
+
+	dbA[data["id"]] = data["value"]
+
+	// Strong consistency: immediately update Service B
+	muB.Lock()
+	defer muB.Unlock()
+	dbB[data["id"]] = data["value"]
+
+	fmt.Fprintf(w, "Service A: Data saved with strong consistency, id: %s", data["id"])
 }
 
-func testInvalidToken(t *testing.T, tokenString string, secret []byte) {
-	token, err := jwt.ParseWithClaims(tokenString, &jwt.StandardClaims{}, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
-		}
-		return secret, nil
-	})
-
-	if err == nil {
-		t.Errorf("Expected error, got valid token: %+v", token)
+// Service B: Eventual Consistency using message broker
+func serviceB(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
 	}
+
+	var data map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	// Simulated eventual consistency by sending a message to the broker
+	message := fmt.Sprintf("Eventual consistency message for id: %s, value: %s", data["id"], data["value"])
+	messageBroker <- message
+
+	fmt.Fprintf(w, "Service B: Message sent to broker for eventual consistency, id: %s", data["id"])
 }
 
-func testExpiredToken(t *testing.T, tokenString string) {
-	_, err := jwt.ParseWithClaims(tokenString, &jwt.StandardClaims{}, func(token *jwt.Token) (interface{}, error) {
-		return nil, nil
-	})
+// Simulate the message broker processing messages
+func messageBrokerProcess() {
+	for message := range messageBroker {
+		time.Sleep(2 * time.Second) // Simulate delay in processing
+		// Here we would update Service B's database
+		parts := strings.Split(message, ", ")
+		id := strings.Split(parts[0], ": ")[1]
+		value := strings.Split(parts[1], ": ")[1]
 
-	if err == nil || !errors.Is(err, jwt.ErrSignatureExpired) {
-		t.Errorf("Expected expired token error, got: %v", err)
-	}
-}
+		muB.Lock()
+		dbB[id] = value
+		muB.Unlock()
 
-func testWeakSigningAlgorithm(t *testing.T, tokenString string, secret []byte) {
-	token, err := jwt.ParseWithClaims(tokenString, &jwt.StandardClaims{}, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok || token.Method.Algorithm() == jwt.HS224 {
-			return nil, fmt.Errorf("Weak signing algorithm detected: %v", token.Header["alg"])
-		}
-		return secret, nil
-	})
-
-	if err == nil {
-		t.Errorf("Expected weak signing algorithm error, got valid token: %+v", token)
+		log.Printf("Message processed: %s", message)
 	}
 }
 
 func main() {
-	testing.Run(os.Args[0], func(m *testing.M) {
-		os.Exit(m.Run())
-	})
+	// Start message broker processing in a separate goroutine
+	go messageBrokerProcess()
+
+	http.HandleFunc("/serviceA", serviceA)
+	http.HandleFunc("/serviceB", serviceB)
+
+	log.Println("Starting server on :8080")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatal(err)
+	}
 }
