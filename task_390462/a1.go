@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	_"fmt"
+	"fmt"
 	"log"
 	"net/url"
 	"time"

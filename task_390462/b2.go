@@ -1,98 +1,117 @@
+package main
 
-package main  
-import (  
-        "context"
-        "errors"
-        "fmt"
-        "log"
-        "net/url"
-        "sync"
-        "time"
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"net/http"
+	"sync"
+	"time"
 
-        "github.com/gorilla/websocket"
-        "github.com/kelseyhightower/envconfig"
+	"github.com/gorilla/websocket"
 )
 
-// WebSocketConfig holds configuration for WebSocket client
-type WebSocketConfig struct {
-        URL                string        `envconfig:"WS_URL" default:"ws://localhost:8080/ws"`
-        MaxReconnectionAttempts int         `envconfig:"MAX_RECONNECTION_ATTEMPTS" default:"5"`
-        ReconnectionBackoff    time.Duration `envconfig:"RECONNECTION_BACKOFF" default:"1s"`
-        ReadTimeout            time.Duration `envconfig:"READ_TIMEOUT" default:"10s"`
-        WriteTimeout           time.Duration `envconfig:"WRITE_TIMEOUT" default:"10s"`
-        PingPeriod             time.Duration `envconfig:"PING_PERIOD" default:"30s"`
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }
 
-// WebSocketClient represents a WebSocket client  
-type WebSocketClient struct {  
-        config WebSocketConfig
-        conn   *websocket.Conn
-        connMu sync.Mutex
-        connChan chan *websocket.Conn
-        disconnectChan chan error
-        reconnectCtx context.Context
-        reconnectFunc context.CancelFunc
-        isConnected bool
-}  
+type Client struct {
+	conn         *websocket.Conn
+	mutex        sync.Mutex
+	lastMessage  []byte
+	messageQueue chan []byte
+	ctx          context.Context
+	cancel       context.CancelFunc
+}
 
-// NewWebSocketClient creates a new WebSocket client  
-func NewWebSocketClient() (*WebSocketClient, error) {  
-        var config WebSocketConfig
-        if err := envconfig.Process("ws", &config); err != nil {
-                return nil, err
-        }
-        wsc := &WebSocketClient{
-                config: config,
-                connChan: make(chan *websocket.Conn),
-                disconnectChan: make(chan error),
-        }
-        return wsc, nil
-}  
+func newClient() *Client {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Client{
+		messageQueue: make(chan []byte, 100),
+		ctx:          ctx,
+		cancel:       cancel,
+	}
+}
 
-// Connect establishes a WebSocket connection and starts handling reconnections  
-func (wsc *WebSocketClient) Connect(ctx context.Context) {  
-        wsc.connMu.Lock()
-        defer wsc.connMu.Unlock()
+func (c *Client) handleConnection() {
+	defer c.conn.Close()
 
-        if wsc.isConnected {
-                log.Println("Already connected")
-                return
-        }
+	for {
+		select {
+		case msg := <-c.messageQueue:
+			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				log.Println("Write error:", err)
+				// If write fails, attempt to reconnect.
+				c.reconnect()
+				return
+			}
+		case <-c.ctx.Done():
+			log.Println("Disconnecting due to context cancellation")
+			return
+		}
+	}
+}
 
-        wsc.reconnectCtx, wsc.reconnectFunc = context.WithCancel(ctx)
-        go wsc.reconnect(wsc.reconnectCtx)
-        log.Println("Connecting to WebSocket server")
-}  
+func (c *Client) reconnect() {
+	for {
+		log.Println("Attempting to reconnect...")
+		conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8080/ws", nil)
+		if err != nil {
+			log.Println("Reconnect failed:", err)
+			time.Sleep(time.Second * 2) // Retry after a short delay.
+			continue
+		}
 
-func (wsc *WebSocketClient) reconnect(ctx context.Context) {  
-        attempt := 0
-        for {  
-                select {  
-                case <-ctx.Done():  
-                        log.Println("Reconnection context done, stopping")  
-                        return  
-                default:  
-                        attempt++
-                        if err := wsc.connectOnce(ctx); err != nil {  
-                                log.Printf("Reconnect attempt %d failed: %v\n", attempt, err)  
-                                if attempt >= wsc.config.MaxReconnectionAttempts {  
-                                        log.Println("Exceeded maximum reconnection attempts")  
-                                        return  
-                                }  
-                                backoff := time.Duration(attempt) * wsc.config.ReconnectionBackoff  
-                                log.Printf("Reconnecting in %s\n", backoff)  
-                                time.Sleep(backoff)  
-                        } else {  
-                                log.Println("Reconnected successfully")  
-                                attempt = 0  
-                                return  
-                        }  
-                }  
-        }  
-}  
+		// Clear old connection and set new one.
+		c.mutex.Lock()
+		c.conn = conn
+		c.mutex.Unlock()
 
-func (wsc *WebSocketClient) connectOnce(ctx context.Context) error {  
-        // Connect to the WebSocket server  
-        dialer := websocket.Dialer{  
-                ReadTimeout:  wsc.config.ReadTimeout,  
-                WriteTimeout: wsc.config.WriteTimeout,
+		log.Println("Reconnected successfully.")
+		go c.handleConnection()
+		
+		// Send all the queued messages during reconnect.
+		for msg := range c.messageQueue {
+			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				log.Println("Write error during reconnect:", err)
+				break
+			}
+		}
+		return
+	}
+}
+
+func (c *Client) SendMessage(msg []byte) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if c.conn == nil {
+		// If connection is nil, queue the message.
+		c.messageQueue <- msg
+		return
+	}
+
+	// If connection is established, send the message directly.
+	if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+		log.Println("Write error:", err)
+		// If write fails, attempt to reconnect.
+		c.reconnect()
+	}
+}
+
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("Upgrade error:", err)
+		return
+	}
+
+	client := newClient()
+	client.conn = conn
+	go client.handleConnection()
+}
+
+func main() {
+	http.HandleFunc("/ws", handleWebSocket)

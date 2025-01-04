@@ -1,129 +1,109 @@
 package main
 
 import (
-	"context"
-	"fmt"
 	"log"
-	"math"
-	"net/url"
-	"strconv"
+	"net/http"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-type WebSocketClient struct {
-	url        *url.URL
-	conn       *websocket.Conn
-	reconnectCtx context.Context
-	reconnectFunc context.CancelFunc
-	state        map[string]interface{}
-	cfg         Config
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }
 
-type Config struct {
-	MaxReconnectAttempts int
-	InitialBackoff       time.Duration
-	BackoffFactor        float64
-	DisconnectTimeout   time.Duration
+type Client struct {
+	conn      *websocket.Conn
+	state     map[string]interface{}
+	lastMessage []byte
+	reconnect int
 }
 
-func NewWebSocketClient(url *url.URL, cfg Config) *WebSocketClient {
-	return &WebSocketClient{
-		url:          url,
-		cfg:          cfg,
-		state:        make(map[string]interface{}),
-		reconnectCtx: context.Background(),
-	}
-}
+func (c *Client) handleConnection() {
+	defer c.conn.Close()
 
-func (wsc *WebSocketClient) Connect() error {
-	ctx, cancel := context.WithCancel(wsc.reconnectCtx)
-	wsc.reconnectFunc = cancel
-	for attempt := 1; attempt <= wsc.cfg.MaxReconnectAttempts; attempt++ {
-		log.Printf("Attempt %d to connect to WebSocket server at %s\n", attempt, wsc.url)
-		dialer := websocket.DefaultDialer{
-			ReadTimeout:  wsc.cfg.DisconnectTimeout,
-			WriteTimeout: wsc.cfg.DisconnectTimeout,
-		}
-		conn, _, err := dialer.DialContext(ctx, wsc.url.String(), nil)
-		if err != nil {
-			log.Printf("Failed to connect: %v\n", err)
-			time.Sleep(wsc.backoffDuration(attempt))
-			continue
-		}
-		wsc.conn = conn
-		go wsc.handleMessages(conn)
-		go wsc.handleConnection(conn)
-		return nil
-	}
-	return fmt.Errorf("exceeded maximum reconnection attempts")
-}
-
-func (wsc *WebSocketClient) handleConnection(conn *websocket.Conn) {
-	defer conn.Close()
 	for {
-		select {
-		case <-wsc.reconnectCtx.Done():
-			log.Println("Reconnection context done, closing connection")
-			return
-		case <-time.After(wsc.cfg.DisconnectTimeout):
-			wsc.disconnect(fmt.Errorf("connection timed out"))
-		}
-	}
-}
-
-func (wsc *WebSocketClient) handleMessages(conn *websocket.Conn) {
-	for {
-		_, message, err := conn.ReadMessage()
+		messageType, message, err := c.conn.ReadMessage()
 		if err != nil {
-			wsc.disconnect(err)
+			log.Println("Read error:", err)
+			// Attempt to reconnect on failure.
+			c.reconnect++
+			c.reconnectWithBackoff()
 			return
 		}
-		log.Printf("Received message: %s\n", string(message))
-		// Process the message and update state as needed
-		wsc.updateState(string(message))
+
+		c.lastMessage = message
+		log.Printf("Received: %s\n", message)
+
+		// Handle state updates here.
+		// For simplicity, let's log the received state.
+		if len(message) > 0 {
+			c.updateState(string(message))
+		}
+
+		// For demonstration, echo back the message.
+		if err = c.conn.WriteMessage(messageType, message); err != nil {
+			log.Println("Write error:", err)
+			break
+		}
 	}
 }
 
-func (wsc *WebSocketClient) backoffDuration(attempt int) time.Duration {
-	base := time.Duration(wsc.cfg.InitialBackoff)
-	multiplier := math.Pow(float64(wsc.cfg.BackoffFactor), float64(attempt-1))
-	return base * time.Duration(multiplier)
-}
-
-func (wsc *WebSocketClient) disconnect(err error) {
-	log.Printf("Disconnected: %v\n", err)
-	if wsc.conn != nil {
-		wsc.conn.Close()
+func (c *Client) reconnectWithBackoff() {
+	time.Sleep(c.backoff())
+	log.Println("Attempting to reconnect...")
+	conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8080/ws", nil)
+	if err != nil {
+		log.Println("Reconnect failed:", err)
+		return
 	}
-	wsc.Connect()
+	c.conn = conn
+	log.Println("Reconnected successfully.")
+	go c.handleConnection()
 }
 
-func (wsc *WebSocketClient) updateState(message string) {
-	// Example state update based on message content
-	var key, value string
-	fmt.Sscanf(message, "%s=%s", &key, &value)
-	wsc.state[key] = value
-	log.Printf("State updated: %s=%s\n", key, value)
+func (c *Client) backoff() time.Duration {
+	if c.reconnect == 0 {
+		return 100 * time.Millisecond // Fast initial reconnect.
+	}
+	base := 250 * time.Millisecond
+	factor := 1.5
+	max := 2 * time.Second
+	return time.Duration(min(int64(base*time.Millisecond*float64(math.Pow(factor, float64(c.reconnect)))), max.Nanoseconds()))
+}
+
+func (c *Client) updateState(data string) {
+	if c.state == nil {
+		c.state = make(map[string]interface{})
+	}
+	// For simplicity, assume data is JSON-encoded key-value pairs.
+	// Replace this with a proper JSON parsing/unmarshalling logic.
+	for _, pair := range strings.Split(data, ";") {
+		key, value := strings.Split(pair, "=")
+		c.state[key] = value
+	}
+	log.Printf("State updated: %+v\n", c.state)
+}
+
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("Upgrade error:", err)
+		return
+	}
+
+	client := &Client{
+		conn: conn,
+	}
+
+	// Handle the connection
+	go client.handleConnection()
 }
 
 func main() {
-	wsUrl, _ := url.Parse("ws://localhost:8080/ws")
-	wsc := NewWebSocketClient(wsUrl, Config{
-		MaxReconnectAttempts: 10,
-		InitialBackoff:       time.Second,
-		BackoffFactor:        2.0,
-		DisconnectTimeout:   time.Minute,
-	})
-
-	if err := wsc.Connect(); err != nil {
-		log.Fatalf("Failed to connect: %v\n", err)
-	}
-
-	select {
-	case <-time.After(time.Hour): // Keep running for an hour for demonstration purposes
-	}
-
-	wsc.reconnectFunc() // Disconnect by cancelling the reconnection context
+	http.HandleFunc("/ws", handleWebSocket)
+	log.Println("WebSocket server started on :8080/ws")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
