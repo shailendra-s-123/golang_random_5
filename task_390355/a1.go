@@ -1,73 +1,65 @@
 package main
 
 import (
-    "context"
-    "fmt"
-    "net/http"
     "github.com/gorilla/websocket"
-    "github.com/dgrijalva/jwt-go"
+    "github.com/graphql-go/graphql"
+    "github.com/graphql-go/handler"
+    "net/http"
+    "time"
 )
 
 var upgrader = websocket.Upgrader{
     CheckOrigin: func(r *http.Request) bool {
-        return true // Allow all origins for simplicity; adjust in production
+        return true // Set proper CORS policy here
     },
 }
 
-// Secret key used for signing JWTs
-var secretKey = []byte("your_secret_key")
-
-// Function to validate the JWT token
-func validateToken(tokenString string) (*jwt.Token, error) {
-    return jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-        // Ensure that the token's signing method is HMAC
-        if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-            return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-        }
-        return secretKey, nil
-    })
+// JWT validation function
+func validateToken(token string) (string, error) {
+    // Implement your JWT validation logic here
+    // Return user ID or any user information if valid, else return error
 }
 
-// WebSocket connection handler
+// WebSocket handler
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-    tokenString := r.URL.Query().Get("token") // Get token from query params
-
-    // Validate the token
-    token, err := validateToken(tokenString)
-    if err != nil || !token.Valid {
-        http.Error(w, "Unauthorized", http.StatusUnauthorized)
-        return
-    }
-
-    // Upgrade connection to WebSocket
     conn, err := upgrader.Upgrade(w, r, nil)
     if err != nil {
-        http.Error(w, "Could not open websocket connection", http.StatusBadRequest)
+        http.Error(w, "Could not upgrade connection", http.StatusBadRequest)
+        return
+    }
+    defer conn.Close()
+
+    // Extract token from query parameters
+    token := r.URL.Query().Get("token")
+    userID, err := validateToken(token)
+    if err != nil {
+        conn.WriteMessage(websocket.TextMessage, []byte("Unauthorized"))
         return
     }
 
-    // Handle the connection (implement your subscription logic here)
-    defer conn.Close()
+    // Handle subscription logic here
+    // Use userID to determine what data the user can subscribe to
+
     for {
-        // Example of reading messages from the WebSocket
         _, msg, err := conn.ReadMessage()
         if err != nil {
             break
         }
-        fmt.Printf("Received: %s\n", msg)
-        
-        // Echo the message back for demonstration
-        err = conn.WriteMessage(websocket.TextMessage, msg)
-        if err != nil {
-            break
-        }
+        // Handle incoming message (GraphQL subscription)
+        // Respond to client with updated data
     }
 }
 
 func main() {
+    http.Handle("/", handler.NewGraphQLHandler(/* your GraphQL schema */))
+
     http.HandleFunc("/ws", wsHandler)
-    fmt.Println("Server started on :8080")
-    if err := http.ListenAndServeTLS(":8080", "server.crt", "server.key", nil); err != nil {
-        panic("Failed to start server: " + err.Error())
+
+    // Start the server
+    srv := &http.Server{
+        Addr:         ":8080",
+        ReadTimeout:  10 * time.Second,
+        WriteTimeout: 10 * time.Second,
     }
+    srv.ListenAndServe()
 }

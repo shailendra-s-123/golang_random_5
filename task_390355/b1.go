@@ -6,198 +6,83 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"time"
 
+	"github.com/99designs/gqlgen/graphql"
+	"github.com/99designs/gqlgen/handler"
 	"github.com/gorilla/websocket"
-	"github.com/graph-gophers/graphql-go"
-	"github.com/graph-gophers/graphql-go/handler"
-	"github.com/graph-gophers/graphql-go/introspection"
-	"github.com/graph-gophers/graphql-go/playground"
-	"github.com/joho/godotenv"
-	jwt "github.com/dgrijalva/jwt-go"
 )
 
-var (
-	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			return true // For simplicity, allow all origins in this example
-		},
-	}
-	secretKey = []byte("your_secret_key_here") // Replace with a secure key
-)
+// Define your schema and resolvers
+// ... (omitted for brevity)
 
-type Query struct {
-}
-
-type Mutation struct {
-}
-
-type Subscription struct {
-}
-
-var schema = graphql.NewSchema(graphql.SchemaConfig{
-	Query:    graphql.NewObject(graphql.ObjectConfig{Name: "Query", Type: graphql.EmptyInterface()}),
-	Mutation: graphql.NewObject(graphql.ObjectConfig{Name: "Mutation", Type: graphql.EmptyInterface()}),
-	Subscription: graphql.NewObject(graphql.ObjectConfig{
-		Name: "Subscription",
-		Type: graphql.EmptyInterface(),
-	}),
-	Fields: graphql.Fields{
-		"__schema": &graphql.Field{
-			Type: introspection.Schema.Type(),
-			Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-				return introspection.Schema(p.Context), nil
-			},
-		},
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Replace this with your origin check logic
 	},
-})
-
-func main() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
-	}
-
-	http.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST")
-		w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, Origin")
-
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		var requestHandler handler.Handler
-		requestHandler = handler.New(&handler.Config{
-			Schema: &schema,
-			Playground: true,
-			GraphiQL:  true,
-			Context: func(r *http.Request) context.Context {
-				ctx := r.Context()
-				token, err := getTokenFromHeader(r)
-				if err != nil {
-					log.Println("Error getting token:", err)
-					return ctx
-				}
-
-				claims, err := verifyToken(token)
-				if err != nil {
-					log.Println("Error verifying token:", err)
-					return ctx
-				}
-
-				return context.WithValue(ctx, "user", claims)
-			},
-		})
-
-		requestHandler.ServeHTTP(w, r)
-	})
-
-	http.HandleFunc("/websocket", handleWebSocket)
-
-	log.Println("Server starting on port 4000")
-	err = http.ListenAndServeTLS(":4000", "server.crt", "server.key", nil)
-	if err != nil {
-		log.Fatal("Error starting server:", err)
-	}
 }
 
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET")
-	w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, Origin")
-
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("Error upgrading to WebSocket:", err)
-		return
-	}
-	defer conn.Close()
-
-	token, err := getTokenFromHeader(r)
-	if err != nil {
-		log.Println("Error getting token for WebSocket:", err)
-		conn.WriteMessage(websocket.TextMessage, []byte("Unauthorized"))
-		return
+func authenticateSubscription(ctx context.Context, conn *websocket.Conn) (context.Context, error) {
+	// Read the JWT from the WebSocket connection headers
+	authHeader := conn.Request().Header.Get("Authorization")
+	if authHeader == "" {
+		return nil, fmt.Errorf("missing authorization header")
 	}
 
+	parts := strings.SplitN(authHeader, " ", 2)
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		return nil, fmt.Errorf("invalid authorization header format")
+	}
+
+	token := parts[1]
+
+	// Verify the token (implement your token verification logic here)
 	claims, err := verifyToken(token)
 	if err != nil {
-		log.Println("Error verifying token for WebSocket:", err)
-		conn.WriteMessage(websocket.TextMessage, []byte("Unauthorized"))
-		return
+		return nil, fmt.Errorf("invalid token: %w", err)
 	}
 
-	for {
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			log.Println("Error reading WebSocket message:", err)
-			break
-		}
-
-		var query struct {
-			Query string `json:"query"`
-		}
-		if err := json.Unmarshal(message, &query); err != nil {
-			log.Println("Error unmarshaling WebSocket message:", err)
-			continue
-		}
-
-		result := executeQuery(ctx, query.Query)
-		response, err := json.Marshal(result)
-		if err != nil {
-			log.Println("Error marshaling response:", err)
-			continue
-		}
-
-		err = conn.WriteMessage(websocket.TextMessage, response)
-		if err != nil {
-			log.Println("Error writing WebSocket response:", err)
-			break
-		}
-	}
+	// Add the verified claims to the context
+	return context.WithValue(ctx, "claims", claims), nil
 }
 
-func executeQuery(ctx context.Context, query string) interface{} {
-	params := graphql.Params{
-		Schema:        &schema,
-		RequestString: query,
-		Context:       ctx,
-	}
-	return graphql.Do(params)
-}
+func main() {
+	// Define your resolvers
+	// ... (omitted for brevity)
 
-func getTokenFromHeader(r *http.Request) (string, error) {
-	token := r.Header.Get("Authorization")
-	if token == "" {
-		return "", fmt.Errorf("token not found in header")
-	}
-	return strings.TrimPrefix(token, "Bearer "), nil
-}
+	srv := handler.NewServer(graphql.NewExecutableSchema(graphql.Config{Resolvers: resolvers}))
 
-func verifyToken(tokenString string) (*jwt.StandardClaims, error) {
-	token, err := jwt.ParseWithClaims(tokenString, &jwt.StandardClaims{}, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHS256); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+	http.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			srv.ServeHTTP(w, r)
+		} else if r.Method == http.MethodUpgrade {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				log.Printf("upgrade error: %v", err)
+				return
+			}
+			defer conn.Close()
+
+			ctx, err := authenticateSubscription(context.Background(), conn)
+			if err != nil {
+				log.Printf("authentication error: %v", err)
+				conn.WriteMessage(websocket.TextMessage, []byte(`{"error": "Authentication failed"}`))
+				return
+			}
+
+			srv.HandleWebSocketConnection(ctx, conn)
+		} else {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		}
-		return secretKey, nil
 	})
 
-	if err != nil {
-		return nil, err
+	log.Println("starting server on :8080")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatal(err)
 	}
+}
 
-	claims, ok := token.Claims.(*jwt.StandardClaims)
-	if !ok || !token.Valid {
-		return nil, fmt.Errorf("invalid token")
-	}
-
-	if time.Now().Unix() > claims.Exp {
-		return nil, fmt.Errorf("token expired")
-	}
-
-	return claims, nil
+// Implement your token verification logic
+func verifyToken(token string) (map[string]interface{}, error) {
+	// ... (implement token verification logic here)
+	return nil, nil
 }
