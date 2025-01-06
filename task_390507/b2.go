@@ -4,108 +4,154 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type RateLimiter struct {
-	tokenCh  chan struct{} // Channel for managing tokens
-	stopCh   chan struct{} // Channel to stop the token replenishment
-	capacity int           // Maximum number of tokens in the bucket
-	rate     float64       // Tokens per second
-	wg       sync.WaitGroup // Wait group to synchronize goroutines
+	c           chan struct{}
+	done        chan struct{}
+	interval    time.Duration
+	capacity    int
+	mu          sync.Mutex
+	queueSize   atomic.Int32
+	requestFreq atomic.Int32
 }
 
-// NewRateLimiter initializes a new RateLimiter with the given capacity and rate
-func NewRateLimiter(capacity int, rate float64) *RateLimiter {
-	rand.Seed(time.Now().UnixNano())
-	limiter := &RateLimiter{
-		tokenCh:  make(chan struct{}, capacity),
-		stopCh:   make(chan struct{}),
-		capacity: capacity,
-		rate:     rate,
+func NewRateLimiter(initialCapacity int, interval time.Duration) *RateLimiter {
+	c := make(chan struct{}, initialCapacity)
+	for i := 0; i < initialCapacity; i++ {
+		c <- struct{}{}
 	}
 
-	// Start the goroutine to replenish tokens
-	go limiter.replenishTokens()
+	limiter := &RateLimiter{
+		c:           c,
+		done:        make(chan struct{}),
+		interval:    interval,
+		capacity:    initialCapacity,
+		queueSize:   atomic.NewInt32(0),
+		requestFreq: atomic.NewInt32(0),
+	}
+
+	go limiter.leak()
+	go limiter.monitorMetrics()
 	return limiter
 }
 
-// replenishTokens continuously adds tokens to the bucket at the specified rate
-func (rl *RateLimiter) replenishTokens() {
-	defer rl.wg.Done()
-	ticker := time.NewTicker(1 * time.Second)
+func (rl *RateLimiter) leak() {
+	ticker := time.NewTicker(rl.interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			// Calculate the number of tokens to add
-			tokensToAdd := int(rl.rate)
-			for tokensToAdd > 0 && len(rl.tokenCh) < rl.capacity {
-				rl.tokenCh <- struct{}{}
-				tokensToAdd--
+			rl.mu.Lock()
+			// Scale capacity based on queue size and request frequency
+			currentCapacity := rl.capacity
+			if atomic.LoadInt32(&rl.queueSize) > 10 {
+				currentCapacity = max(currentCapacity-1, 1)
+			} else if atomic.LoadInt32(&rl.requestFreq) > 100 {
+				currentCapacity += 1
 			}
-		case <-rl.stopCh:
+			if currentCapacity != rl.capacity {
+				rl.capacity = currentCapacity
+				fmt.Printf("Scaling bucket capacity to %d\n", currentCapacity)
+				for i := 0; i < currentCapacity-rl.capacity; i++ {
+					rl.c <- struct{}{}
+				}
+				for i := 0; i < rl.capacity-currentCapacity; i++ {
+					<-rl.c
+				}
+			}
+			rl.mu.Unlock()
+
+		case <-rl.done:
 			return
 		}
 	}
 }
 
-// Acquire attempts to acquire a token, blocking if the bucket is empty
-func (rl *RateLimiter) Acquire() {
-	rl.wg.Add(1)
-	defer rl.wg.Done()
-	<-rl.tokenCh // Wait for a token
-}
+func (rl *RateLimiter) Allow(priority int) bool {
+	rl.queueSize.Inc()
+	defer rl.queueSize.Dec()
 
-// Release returns a token to the bucket
-func (rl *RateLimiter) Release() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	if priority == 1 { // High priority: skip the queue
+		select {
+		case rl.c <- struct{}{}:
+			return true
+		default:
+			return false
+		}
+	}
+
 	select {
-	case rl.tokenCh <- struct{}{}: // Return the token
+	case <-rl.c:
+		return true
 	default:
-		// Bucket is full, do nothing (this should rarely happen with correct rate calculation)
+		return false
 	}
 }
 
-// Shutdown stops the token replenishment goroutine
-func (rl *RateLimiter) Shutdown() {
-	close(rl.stopCh)
-	rl.wg.Wait()
+func (rl *RateLimiter) monitorMetrics() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			atomic.StoreInt32(&rl.requestFreq, 0)
+			fmt.Printf("Queue Size: %d, Request Frequency: %d\n", atomic.LoadInt32(&rl.queueSize), rl.requestFreq)
+		case <-rl.done:
+			return
+		}
+	}
 }
 
-func processTask(id int, limiter *RateLimiter) {
-	limiter.Acquire() // Acquire a token to process the task
-	defer limiter.Release()
+func processTask(id int, priority int, rateLimiter *RateLimiter, wg *sync.WaitGroup) {
+	defer wg.Done()
+	if rateLimiter.Allow(priority) {
+		start := time.Now()
+		fmt.Printf("Processing task %d (priority %d)\n", id, priority)
+		time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
+		fmt.Printf("Completed task %d (priority %d) in %s\n", id, priority, time.Since(start))
 
-	fmt.Printf("Processing task %d\n", id)
-	time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
-	fmt.Printf("Completed task %d\n", id)
+		atomic.AddInt32(&rateLimiter.requestFreq, 1)
+	} else {
+		fmt.Printf("Task %d (priority %d) rejected due to rate limiting\n", id, priority)
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func main() {
 	const (
-		taskCount    = 50
-		bucketSize   = 5
-		ratePerSec   = 10.0 // 10 tasks per second
-		workerCount = 5
+		taskCount      = 50
+		highPriorityCount = 10
+		initialCapacity = 5
+		interval       = 500 * time.Millisecond
 	)
 
-	limiter := NewRateLimiter(bucketSize, ratePerSec)
-	defer limiter.Shutdown()
-
+	rateLimiter := NewRateLimiter(initialCapacity, interval)
 	var wg sync.WaitGroup
 
-	// Create a pool of worker goroutines
-	for i := 0; i < workerCount; i++ {
+	for i := 1; i <= taskCount; i++ {
+		priority := 1
+		if i > highPriorityCount {
+			priority = 0
+		}
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 1; i <= taskCount; i++ {
-				processTask(i, limiter)
-			}
-		}()
+		go processTask(i, priority, rateLimiter, &wg)
 	}
 
 	wg.Wait()
+	rateLimiter.Shutdown()
 	fmt.Println("All tasks processed.")
 }
