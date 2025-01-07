@@ -25,36 +25,25 @@ type CustomClaims struct {
 	jwt.RegisteredClaims
 }
 
-// Secret keys for signing tokens (replace with environment variables in production).
+// Secret keys for signing tokens (use environment variables in production).
 var (
 	AccessTokenSecret  = []byte("your-access-token-secret")
 	RefreshTokenSecret = []byte("your-refresh-token-secret")
 )
 
-// GetTokenLifetimes determines token lifetimes based on user role and activity.
-func GetTokenLifetimes(role string, activityLevel int) (accessTime, refreshTime time.Duration) {
+// GetTokenLifetimes determines token lifetimes dynamically based on the user's role.
+func GetTokenLifetimes(role string) (time.Duration, time.Duration) {
 	switch role {
 	case "admin":
-		accessTime = 10 * time.Minute
+		return 10 * time.Minute, 1 * time.Hour // Shorter for higher privilege roles
 	default:
-		accessTime = 15 * time.Minute
+		return 15 * time.Minute, 12 * time.Hour
 	}
-
-	switch activityLevel {
-	case 0: // Inactive
-		refreshTime = 1 * time.Hour
-	case 1: // Moderate
-		refreshTime = 12 * time.Hour
-	case 2: // Active
-		refreshTime = 24 * time.Hour
-	}
-
-	return
 }
 
 // GenerateTokens generates access and refresh tokens with dynamic lifetimes.
-func GenerateTokens(user User, activityLevel int) (string, string, error) {
-	accessLifetime, refreshLifetime := GetTokenLifetimes(user.Role, activityLevel)
+func GenerateTokens(user User) (string, string, error) {
+	accessLifetime, refreshLifetime := GetTokenLifetimes(user.Role)
 
 	// Access Token
 	accessClaims := &CustomClaims{
@@ -90,7 +79,7 @@ func GenerateTokens(user User, activityLevel int) (string, string, error) {
 		return "", "", fmt.Errorf("failed to sign refresh token: %w", err)
 	}
 
-	log.Printf("Generated tokens for user %s (Role: %s, Activity: %d)", user.Username, user.Role, activityLevel)
+	log.Printf("Generated tokens for user %s (Role: %s)", user.Username, user.Role)
 	return accessToken, refreshToken, nil
 }
 
@@ -104,8 +93,14 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	activityLevel := 1 // Example moderate activity
-	accessToken, refreshToken, err := GenerateTokens(user, activityLevel)
+	if user.Username == "" || user.Role == "" {
+		log.Printf("Invalid login attempt: Missing username or role")
+		http.Error(w, "Username and role are required", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Processing login for user %s (Role: %s)", user.Username, user.Role)
+	accessToken, refreshToken, err := GenerateTokens(user)
 	if err != nil {
 		log.Printf("Error generating tokens for user %s: %v", user.Username, err)
 		http.Error(w, fmt.Sprintf("Error generating tokens: %v", err), http.StatusInternalServerError)

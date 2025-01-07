@@ -1,105 +1,110 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
-	"os"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
+	"github.com/golang-jwt/jwt/v4"
 )
 
-type TokenClaims struct {
-	Role string `json:"role"`
-	jwt.StandardClaims
+type User struct {
+	ID       int    `json:"id"`
+	Username string `json:"username"`
+	Role     string `json:"role"`
 }
 
-// Environment variable for secret
-const jwtSecretEnv = "JWT_SECRET_KEY"
+type CustomClaims struct {
+	UserID   int    `json:"user_id"`
+	Username string `json:"username"`
+	Role     string `json:"role"`
+	jwt.RegisteredClaims
+}
 
-// GenerateJWT generates a JWT based on the user role.
-func GenerateJWT(role string) (string, error) {
-	var accessTokenExpiry, refreshTokenExpiry time.Duration
+// Configuration for token secret keys
+var (
+	AccessTokenSecret  = []byte("your-access-token-secret")
+	RefreshTokenSecret = []byte("your-refresh-token-secret")
+)
 
-	// Define token lifetime based on user role
+// GetTokenLifetimes determines token lifetimes based on user role
+func GetTokenLifetimes(role string) (time.Duration, time.Duration) {
 	switch role {
 	case "admin":
-		accessTokenExpiry = 15 * time.Minute   // Admins may have a longer expiry
-		refreshTokenExpiry = 7 * 24 * time.Hour // Longer refresh token for admins
-	case "user":
-		accessTokenExpiry = 15 * time.Minute   // Regular users
-		refreshTokenExpiry = 3 * 24 * time.Hour // Shorter refresh token for regular users
+		return 5 * time.Minute, 1 * time.Hour // Shorter for admin
 	default:
-		accessTokenExpiry = 5 * time.Minute    // Guests or others
-		refreshTokenExpiry = 1 * 24 * time.Hour // Shortest refresh token for guests
+		return 15 * time.Minute, 1 * time.Hour
 	}
+}
 
-	// Generate access token
-	accessTokenClaims := TokenClaims{
-		Role: role,
-		StandardClaims: jwt.StandardClaims{
-			ExpiresAt: time.Now().Add(accessTokenExpiry).Unix(),
-			Issuer:    "my-service",
+// GenerateTokens creates the JWT tokens for a user
+func GenerateTokens(user User) (string, string, error) {
+	accessLifetime, refreshLifetime := GetTokenLifetimes(user.Role)
+
+	// Access token
+	accessClaims := &CustomClaims{
+		UserID:   user.ID,
+		Username: user.Username,
+		Role:     user.Role,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(accessLifetime)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			Issuer:    "myapp",
 		},
 	}
-	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, accessTokenClaims)
-	accessTokenString, err := accessToken.SignedString([]byte(os.Getenv(jwtSecretEnv)))
+	accessToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims).SignedString(AccessTokenSecret)
 	if err != nil {
-		return "", err
+		return "", "", fmt.Errorf("failed to sign access token: %w", err)
 	}
 
-	// Generate refresh token
-	refreshTokenClaims := jwt.StandardClaims{
-		ExpiresAt: time.Now().Add(refreshTokenExpiry).Unix(),
-		Issuer:    "my-service",
+	// Refresh token
+	refreshClaims := &CustomClaims{
+		UserID:   user.ID,
+		Username: user.Username,
+		Role:     user.Role,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(refreshLifetime)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			Issuer:    "myapp",
+		},
 	}
-	refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshTokenClaims)
-	refreshTokenString, err := refreshToken.SignedString([]byte(os.Getenv(jwtSecretEnv)))
+	refreshToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims).SignedString(RefreshTokenSecret)
 	if err != nil {
-		return "", err
+		return "", "", fmt.Errorf("failed to sign refresh token: %w", err)
 	}
 
-	return fmt.Sprintf("Access Token: %s\nRefresh Token: %s", accessTokenString, refreshTokenString), nil
+	return accessToken, refreshToken, nil
 }
 
-// AuthMiddleware checks the validity of the JWT token.
-func AuthMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tokenStr := r.Header.Get("Authorization")
-		if tokenStr == "" {
-			http.Error(w, "Missing token", http.StatusUnauthorized)
-			return
-		}
+// HandleLogin handles user login and token generation
+func HandleLogin(w http.ResponseWriter, r *http.Request) {
+	var user User
+	if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
 
-		claims := &TokenClaims{}
-		_, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
-			return []byte(os.Getenv(jwtSecretEnv)), nil
-		})
-		if err != nil || !claims.Valid() {
-			http.Error(w, "Invalid token", http.StatusUnauthorized)
-			return
-		}
+	// Usually username/password validation must go here...
 
-		// Pass the claims onward
-		next.ServeHTTP(w, r)
-	})
-}
+	accessToken, refreshToken, err := GenerateTokens(user)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error generating tokens: %v", err), http.StatusInternalServerError)
+		return
+	}
 
-// Simple protected handler
-func protectedHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Hello! You have accessed a protected route.")
+	response := map[string]string{
+		"access_token":  accessToken,
+		"refresh_token": refreshToken,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
 }
 
 func main() {
-	// Example of generating JWT on user request
-	role := "user" // This would normally come from user authentication
-	tokens, err := GenerateJWT(role)
-	if err != nil {
-		fmt.Println("Error generating tokens:", err)
-		return
-	}
-	fmt.Println(tokens)
-
-	http.Handle("/protected", AuthMiddleware(http.HandlerFunc(protectedHandler)))
-	http.ListenAndServe(":8080", nil)
+	http.HandleFunc("/login", HandleLogin)
+	log.Println("Server starting on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
